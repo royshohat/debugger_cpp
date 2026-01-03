@@ -6,6 +6,10 @@
 #include <iomanip>
 #include <errno.h>
 #include <cstddef> 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
+#include <elf.h>
 
 
 void Debugger::run() {
@@ -37,10 +41,15 @@ void Debugger::handle_command(const std::string& line) {
     else if (command == "regs") {
         dump_registers();
     }
-    else if (command == "b" || command == "break") {
-        if (args.size() > 1) {
-            long addr = std::stoul(args[1], nullptr, 16);
-            set_breakpoint_at_address(addr);
+	else if (command == "b" || command == "break") {
+		if (args.size() > 1) {
+			// Use the new helper!
+			long addr = get_addr_from_symbol(args[1]);
+			if (addr == 0) {
+				std::cout << "Symbol not found or invalid address" << std::endl;
+			} else {
+				set_breakpoint_at_address(addr);
+			}
         } else { std::cout << "Usage: b <addr>" << std::endl; }
     }
     else if (command == "w" || command == "watch") {
@@ -71,10 +80,12 @@ void Debugger::continue_execution() {
     
     // Check if we hit a breakpoint (RIP is one byte ahead of int3)
     if (m_breakpoints.count(regs.rip - 1)) {
+
         long addr = regs.rip - 1;
-        
+		long data = m_breakpoints[addr];
+
         // Restore instruction
-        ptrace(PTRACE_POKETEXT, m_pid, addr, (void*)m_breakpoints[addr]);
+        ptrace(PTRACE_POKETEXT, m_pid, addr, (void*)data);
         
         // Rewind RIP
         regs.rip = addr;
@@ -84,6 +95,10 @@ void Debugger::continue_execution() {
         ptrace(PTRACE_SINGLESTEP, m_pid, nullptr, nullptr);
         int status;
         waitpid(m_pid, &status, 0);
+
+		// Rewrite the trap instruction
+		long data_with_trap = (data & ~0xFF) | 0xCC;
+		ptrace(PTRACE_POKETEXT, m_pid, addr, (void*)data_with_trap);
 
     }
 
@@ -121,8 +136,53 @@ void Debugger::set_watchpoint_at_address(long addr) {
 void Debugger::dump_registers() {
     struct user_regs_struct regs;
     ptrace(PTRACE_GETREGS, m_pid, nullptr, &regs);
-    std::cout << "RIP: 0x" << std::hex << regs.rip << std::endl;
-    std::cout << "RSP: 0x" << std::hex << regs.rsp << std::endl;
+
+    std::cout << "--- Registers ---" << std::endl;
+    
+    // Helper lambda to print a register neatly aligned
+    auto print_reg = [](const std::string& name, unsigned long long value) {
+        std::cout << std::left << std::setw(4) << name << ": 0x" 
+                  << std::setw(16) << std::setfill('0') << std::hex << value 
+                  << std::setfill(' ') << std::dec << std::endl;
+    };
+
+    // General Purpose
+    print_reg("RAX", regs.rax);
+    print_reg("RBX", regs.rbx);
+    print_reg("RCX", regs.rcx);
+    print_reg("RDX", regs.rdx);
+    
+    // Index & Pointers
+    print_reg("RSI", regs.rsi);
+    print_reg("RDI", regs.rdi);
+    print_reg("RBP", regs.rbp);
+    print_reg("RSP", regs.rsp);
+    
+    // Instruction Pointer
+    print_reg("RIP", regs.rip);
+
+    // Extended Registers (R8-R15)
+    print_reg("R8 ", regs.r8);
+    print_reg("R9 ", regs.r9);
+    print_reg("R10", regs.r10);
+    print_reg("R11", regs.r11);
+    print_reg("R12", regs.r12);
+    print_reg("R13", regs.r13);
+    print_reg("R14", regs.r14);
+    print_reg("R15", regs.r15);
+
+    // Flags
+    print_reg("EFLAGS", regs.eflags);
+    
+    // Segment Registers (Optional but good to have)
+    print_reg("CS", regs.cs);
+    print_reg("SS", regs.ss);
+    print_reg("DS", regs.ds);
+    print_reg("ES", regs.es);
+    print_reg("FS", regs.fs);
+    print_reg("GS", regs.gs);
+
+    std::cout << "-----------------" << std::endl;
 }
 
 void Debugger::examine_memory(long addr) {
@@ -152,4 +212,82 @@ std::vector<std::string> Debugger::split(const std::string &s, char delimiter) {
         tokens.push_back(token);
     }
     return tokens;
+}
+
+void Debugger::load_symbols(const std::string& filename) {
+	// Opening the binary file; Only read cause we are only mapping symbols to address
+	int fd = open(filename.c_str(), O_RDONLY);
+	if(fd < 0) {
+		std::cerr << "Couldn't open file\n";
+		return;
+	}
+	
+	// Getting the stats of the file;
+	struct stat st;
+	fstat(fd, &st);
+
+	// Some mmap stuff
+	void* map_start = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+	if (map_start == MAP_FAILED) {
+        close(fd);
+        std::cerr << "Failed to map file." << std::endl;
+        return;
+    }
+
+	// "Pointer" to the start of the header
+	Elf64_Ehdr* ehdr = (Elf64_Ehdr*)map_start;
+
+	// "Pointer" to the section headers
+	Elf64_Shdr* shdrs = (Elf64_Shdr*)((char*)map_start + ehdr->e_shoff);
+
+	// We will just relay on the integer type
+	//// Finding the string table for section names
+	//// Needed to look for .symtab
+	//Elf64_Shdr* sh_strtab = &shdrs[ehdr->e_shstrndx];
+    //const char* sh_strtab_p = (char*)map_start + sh_strtab->sh_offset;
+
+	// Itrate over the sections until we find symtab or dynamic sym
+	for (int i = 0; i < ehdr->e_shnum; ++i) {
+        
+        // We are looking for SHT_SYMTAB or SHT_DYNSYM (dynamic symbols)
+        if (shdrs[i].sh_type == SHT_SYMTAB || shdrs[i].sh_type == SHT_DYNSYM) {
+            
+            // Found a symbol table! Now point to it.
+            Elf64_Sym* syms = (Elf64_Sym*)((char*)map_start + shdrs[i].sh_offset);
+            
+            // We also need the String Table for the *symbols* themselves
+            // The symbol table header has a link to its string table index
+            Elf64_Shdr* strtab_hdr = &shdrs[shdrs[i].sh_link];
+            const char* strtab_p = (char*)map_start + strtab_hdr->sh_offset;
+
+            // Calculate how many symbols are in this table
+            int num_symbols = shdrs[i].sh_size / sizeof(Elf64_Sym);
+
+            // Iterate the symbols
+            for (int j = 0; j < num_symbols; ++j) {
+                std::string name = strtab_p + syms[j].st_name;
+                long addr = syms[j].st_value;
+
+                // Only store functions and existing symbols
+                if (!name.empty() && addr != 0) {
+                    m_symbol_lookup[name] = addr;
+                }
+            }
+        }
+    }
+	munmap(map_start, st.st_size);
+	close(fd);
+
+}
+
+long Debugger::get_addr_from_symbol(const std::string& name) {
+    if (m_symbol_lookup.count(name)) {
+        return m_symbol_lookup[name];
+    }
+    // If not found, try to parse as hex
+    try {
+        return std::stoul(name, nullptr, 16);
+    } catch(...) {
+        return 0;
+    }
 }

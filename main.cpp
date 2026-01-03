@@ -20,7 +20,7 @@ int main(int argc, char* argv[]) {
     }
     else if (pid >= 1)  {
         // Parent
-        Debugger dbg(pid);
+        Debugger dbg(pid, prog);
         dbg.run();
     }
 }
